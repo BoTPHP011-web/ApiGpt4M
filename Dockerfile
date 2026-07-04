@@ -14,5 +14,5 @@ ENV PORT=8080
 ENV ADMIN_USER=admin
 ENV ADMIN_PASS=gpt4m2024
 
-# Запуск
-CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8080"]
+# Запуск в shell-режиме
+CMD sh -c "uvicorn api:app --host 0.0.0.0 --port ${PORT}"
