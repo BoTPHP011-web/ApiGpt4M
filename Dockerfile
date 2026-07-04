@@ -1,10 +1,18 @@
-FROM ubuntu:22.04
+FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y curl wget && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
 
-# СКАЧИВАЕМ PLAYIT ДЛЯ LINUX X86_64
-RUN curl -LO https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-linux-amd64 && \
-    chmod +x playit-linux-amd64
+# Устанавливаем зависимости
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# ЗАПУСКАЕМ АГЕНТ
-CMD ["/playit-linux-amd64"]
+# Копируем код
+COPY api.py .
+
+# Переменные окружения
+ENV PORT=8080
+ENV ADMIN_USER=admin
+ENV ADMIN_PASS=gpt4m2024
+
+# Запуск
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8080"]
