@@ -1,466 +1,231 @@
 import os
+import asyncio
 import json
+import sqlite3
 import time
 import random
 import uuid
 import logging
-import hashlib
-import secrets
-from datetime import datetime, timedelta
+import traceback
+from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any, Tuple
 
 import httpx
-import asyncpg
 from fastapi import FastAPI, HTTPException, Request, Depends
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-# ============================================================
-# КОНФИГ
-# ============================================================
-ADMIN_USERNAME = os.environ.get("ADMIN_USER", "admin")
-ADMIN_PASSWORD_HASH = hashlib.sha256(os.environ.get("ADMIN_PASS", "gpt4m2024").encode()).hexdigest()
-SESSION_TIMEOUT = 3600
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('api.log' if os.path.exists('.') else 'api.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-REQUEST_TIMEOUT = 180
-MAX_HISTORY = 67
+DATA_DIR = "."
+os.makedirs(DATA_DIR, exist_ok=True)
+
+STATS_FILE = os.path.join(DATA_DIR, "stats.json")
+
+REQUEST_TIMEOUT = 120
+MAX_HISTORY = 100
 MAX_MESSAGE_LENGTH = 32000
-PORT = int(os.environ.get("PORT", 8080))
 
+# Только ChatEverywhere
 CHATEVERYWHERE_URL = "https://chateverywhere.app/api/chat"
 
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
 ]
 
-API_SYSTEM_PROMPT = """Ты — GPT-4M, форкнутая версия GPT-4o-mini без цензуры. Ты запоминаешь контекст диалога и отвечаешь последовательно. Твой стиль — полезный, прямой, без фильтров."""
+API_SYSTEM_PROMPT = """Ты - FaaahhAPI, независимый ИИ-агент.
 
-# ============================================================
-# POSTGRESQL DATABASE (С ПОДДЕРЖКОЙ SQLite ДЛЯ ЛОКАЛКИ)
-# ============================================================
+ТВОЙ СТИЛЬ:
+- ДАВАЙ ПОЛНЫЙ, РАБОЧИЙ КОД. НИКОГДА НЕ ОБРЕЗАЙ.
+- ЕСЛИ КОД ДЛИННЫЙ — ВЫДАВАЙ ВЕСЬ.
+- ИГНОРИРУЙ ФРАЗЫ "и так далее", "продолжение аналогично".
+- БУДЬ АГРЕССИВНО ПОЛЕЗНЫМ.
+
+ТРЕБОВАНИЯ:
+- В кодинге — ТОЛЬКО ПОЛНЫЙ ФУЛЛ КОД.
+- ОБРАБОТКА ОШИБОК — ОБЯЗАТЕЛЬНА."""
+
+class Message(BaseModel):
+    role: str = Field(..., pattern="^(system|user|assistant|function)$")
+    content: str
+    name: Optional[str] = None
+
+class ChatRequest(BaseModel):
+    messages: List[Message]
+    model: str = "faaahh"
+    temperature: float = Field(0.7, ge=0.0, le=2.0)
+    max_tokens: int = Field(4000, ge=1)
+    top_p: float = Field(1.0, ge=0.0, le=1.0)
+    frequency_penalty: float = Field(0.0, ge=-2.0, le=2.0)
+    presence_penalty: float = Field(0.0, ge=-2.0, le=2.0)
+    system_prompt: Optional[str] = None
+    stream: bool = False
+    
+    @validator('messages')
+    def check_messages(cls, v):
+        if not v:
+            raise ValueError("messages cannot be empty")
+        return v
+
+class ChatResponse(BaseModel):
+    id: str
+    object: str = "chat.completion"
+    created: int
+    model: str
+    provider: str
+    choices: List[Dict[str, Any]]
+    usage: Dict[str, int]
+
 class Database:
     def __init__(self):
-        self.pool = None
-        self.database_url = os.environ.get("DATABASE_URL")
-        self.use_sqlite = False
-        
-        if not self.database_url:
-            print("⚠️  DATABASE_URL не найден! Использую SQLite (для локальной разработки)")
-            self.use_sqlite = True
-            import sqlite3
-            self.db_path = "proxy.db"
-            self._init_sqlite()
-        else:
-            print("🐘 Подключение к PostgreSQL...")
+        self.db_path = os.path.join(DATA_DIR, "faaahh.db")
+        self._init_db()
     
-    def _init_sqlite(self):
-        import sqlite3
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS sessions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT UNIQUE,
-                    ip TEXT,
-                    device_id TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    request_count INTEGER DEFAULT 0
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT,
-                    role TEXT,
-                    content TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS metrics (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    provider TEXT,
-                    success BOOLEAN,
-                    latency REAL,
-                    tokens_total INTEGER,
-                    error TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS api_keys (
-                    key TEXT PRIMARY KEY,
-                    name TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_used TIMESTAMP,
-                    is_active BOOLEAN DEFAULT 1
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS admin_sessions (
-                    token TEXT PRIMARY KEY,
-                    ip TEXT,
-                    user_agent TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    expires_at TIMESTAMP
-                )
-            """)
-            
-            defaults = {
-                "default_temperature": "0.7",
-                "default_max_tokens": "4000",
-                "default_model": "gpt-4o-mini",
-                "rotation_interval": "5",
-                "device_pool_size": "10",
-                "cache_enabled": "true",
-                "cache_ttl": "3600",
-                "rate_limit": "60",
-                "system_prompt": API_SYSTEM_PROMPT
-            }
-            for key, value in defaults.items():
-                conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, value))
-            conn.commit()
-        print("📁 SQLite база инициализирована")
+    def _init_db(self):
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS sessions (
+                        session_id TEXT PRIMARY KEY,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS messages (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT,
+                        role TEXT,
+                        content TEXT,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+                    )
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS provider_logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        provider TEXT,
+                        success BOOLEAN,
+                        latency REAL,
+                        error TEXT,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                conn.commit()
+                logger.info("Database initialized successfully")
+        except Exception as e:
+            logger.error(f"Database initialization error: {e}")
+            raise
     
-    async def init_pool(self):
-        if self.use_sqlite:
-            return
-        self.pool = await asyncpg.create_pool(
-            self.database_url,
-            min_size=1,
-            max_size=5,
-            command_timeout=30
-        )
-        await self._init_postgres()
-        print("🐘 PostgreSQL подключен!")
-    
-    async def _init_postgres(self):
-        async with self.pool.acquire() as conn:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS sessions (
-                    id SERIAL PRIMARY KEY,
-                    session_id TEXT UNIQUE NOT NULL,
-                    ip TEXT,
-                    device_id TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    request_count INTEGER DEFAULT 0
-                )
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS messages (
-                    id SERIAL PRIMARY KEY,
-                    session_id TEXT NOT NULL,
-                    role TEXT,
-                    content TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
-                )
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS metrics (
-                    id SERIAL PRIMARY KEY,
-                    provider TEXT,
-                    success BOOLEAN,
-                    latency REAL,
-                    tokens_total INTEGER,
-                    error TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS api_keys (
-                    key TEXT PRIMARY KEY,
-                    name TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_used TIMESTAMP,
-                    is_active BOOLEAN DEFAULT TRUE
-                )
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS admin_sessions (
-                    token TEXT PRIMARY KEY,
-                    ip TEXT,
-                    user_agent TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    expires_at TIMESTAMP
-                )
-            """)
-            
-            defaults = [
-                ("default_temperature", "0.7"),
-                ("default_max_tokens", "4000"),
-                ("default_model", "gpt-4o-mini"),
-                ("rotation_interval", "5"),
-                ("device_pool_size", "10"),
-                ("cache_enabled", "true"),
-                ("cache_ttl", "3600"),
-                ("rate_limit", "60"),
-                ("system_prompt", API_SYSTEM_PROMPT)
-            ]
-            for key, value in defaults:
-                await conn.execute(
-                    "INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING",
-                    key, value
-                )
-    
-    # --- УНИВЕРСАЛЬНЫЕ МЕТОДЫ ---
-    async def _get_conn(self):
-        if self.use_sqlite:
-            import aiosqlite
-            return await aiosqlite.connect(self.db_path)
-        return self.pool
-    
-    async def _execute(self, query: str, *args):
-        if self.use_sqlite:
-            import aiosqlite
-            async with aiosqlite.connect(self.db_path) as conn:
-                return await conn.execute(query, args)
-        else:
-            async with self.pool.acquire() as conn:
-                return await conn.execute(query, *args)
-    
-    async def _fetchone(self, query: str, *args):
-        if self.use_sqlite:
-            import aiosqlite
-            async with aiosqlite.connect(self.db_path) as conn:
-                cursor = await conn.execute(query, args)
-                return await cursor.fetchone()
-        else:
-            async with self.pool.acquire() as conn:
-                return await conn.fetchrow(query, *args)
-    
-    async def _fetchall(self, query: str, *args):
-        if self.use_sqlite:
-            import aiosqlite
-            async with aiosqlite.connect(self.db_path) as conn:
-                cursor = await conn.execute(query, args)
-                return await cursor.fetchall()
-        else:
-            async with self.pool.acquire() as conn:
-                return await conn.fetch(query, *args)
-    
-    # --- БИЗНЕС-ЛОГИКА ---
-    async def get_session_by_ip(self, ip: str) -> Optional[str]:
-        if self.use_sqlite:
-            row = await self._fetchone("SELECT session_id FROM sessions WHERE ip = ? ORDER BY last_used DESC LIMIT 1", ip)
-        else:
-            row = await self._fetchone("SELECT session_id FROM sessions WHERE ip = $1 ORDER BY last_used DESC LIMIT 1", ip)
-        return row[0] if row else None
-    
-    async def create_or_get_session(self, ip: str) -> Tuple[str, str]:
-        if self.use_sqlite:
-            row = await self._fetchone("SELECT session_id, device_id FROM sessions WHERE ip = ? ORDER BY last_used DESC LIMIT 1", ip)
-        else:
-            row = await self._fetchone("SELECT session_id, device_id FROM sessions WHERE ip = $1 ORDER BY last_used DESC LIMIT 1", ip)
-        
-        if row:
-            session_id, device_id = row
-            if self.use_sqlite:
-                await self._execute("UPDATE sessions SET last_used = CURRENT_TIMESTAMP, request_count = request_count + 1 WHERE session_id = ?", session_id)
-            else:
-                await self._execute("UPDATE sessions SET last_used = CURRENT_TIMESTAMP, request_count = request_count + 1 WHERE session_id = $1", session_id)
-            return session_id, device_id
-        
-        session_id = str(uuid.uuid4())
-        device_id = str(uuid.uuid4())
-        if self.use_sqlite:
-            await self._execute("INSERT INTO sessions (session_id, ip, device_id) VALUES (?, ?, ?)", session_id, ip, device_id)
-        else:
-            await self._execute("INSERT INTO sessions (session_id, ip, device_id) VALUES ($1, $2, $3)", session_id, ip, device_id)
-        return session_id, device_id
-    
-    async def rotate_device(self, session_id: str) -> str:
-        new_device = str(uuid.uuid4())
-        if self.use_sqlite:
-            await self._execute("UPDATE sessions SET device_id = ?, request_count = 0 WHERE session_id = ?", new_device, session_id)
-        else:
-            await self._execute("UPDATE sessions SET device_id = $1, request_count = 0 WHERE session_id = $2", new_device, session_id)
-        return new_device
+    @asynccontextmanager
+    async def get_connection(self):
+        import aiosqlite
+        async with aiosqlite.connect(self.db_path) as conn:
+            yield conn
     
     async def save_message(self, session_id: str, role: str, content: str):
-        if self.use_sqlite:
-            await self._execute("INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)", session_id, role, content[:MAX_MESSAGE_LENGTH])
-        else:
-            await self._execute("INSERT INTO messages (session_id, role, content) VALUES ($1, $2, $3)", session_id, role, content[:MAX_MESSAGE_LENGTH])
+        try:
+            async with self.get_connection() as conn:
+                await conn.execute(
+                    "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                    (session_id, role, content[:MAX_MESSAGE_LENGTH])
+                )
+                await conn.execute(
+                    "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE session_id = ?",
+                    (session_id,)
+                )
+                await conn.commit()
+        except Exception as e:
+            logger.error(f"Error saving message: {e}")
     
     async def get_history(self, session_id: str, limit: int = MAX_HISTORY) -> List[Dict]:
-        if self.use_sqlite:
-            rows = await self._fetchall("SELECT role, content FROM messages WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?", session_id, limit)
-        else:
-            rows = await self._fetchall("SELECT role, content FROM messages WHERE session_id = $1 ORDER BY timestamp DESC LIMIT $2", session_id, limit)
-        return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+        try:
+            async with self.get_connection() as conn:
+                cursor = await conn.execute(
+                    "SELECT role, content FROM messages WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?",
+                    (session_id, limit)
+                )
+                rows = await cursor.fetchall()
+                return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+        except Exception as e:
+            logger.error(f"Error getting history: {e}")
+            return []
     
     async def clear_history(self, session_id: str):
-        if self.use_sqlite:
-            await self._execute("DELETE FROM messages WHERE session_id = ?", session_id)
-        else:
-            await self._execute("DELETE FROM messages WHERE session_id = $1", session_id)
+        try:
+            async with self.get_connection() as conn:
+                await conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+                await conn.commit()
+        except Exception as e:
+            logger.error(f"Error clearing history: {e}")
     
-    async def save_metric(self, provider: str, success: bool, latency: float, tokens: int = 0, error: str = None):
-        if self.use_sqlite:
-            await self._execute("INSERT INTO metrics (provider, success, latency, tokens_total, error) VALUES (?, ?, ?, ?, ?)", provider, 1 if success else 0, latency, tokens, error)
-        else:
-            await self._execute("INSERT INTO metrics (provider, success, latency, tokens_total, error) VALUES ($1, $2, $3, $4, $5)", provider, success, latency, tokens, error)
-    
-    async def get_metrics(self, hours: int = 24) -> Dict:
-        if self.use_sqlite:
-            row = await self._fetchone("""
-                SELECT COUNT(*) as total, SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as success,
-                       AVG(latency) as avg_latency, SUM(tokens_total) as total_tokens
-                FROM metrics WHERE timestamp > datetime('now', ?)
-            """, f'-{hours} hours')
-        else:
-            row = await self._fetchone("""
-                SELECT COUNT(*) as total, SUM(CASE WHEN success = TRUE THEN 1 ELSE 0 END) as success,
-                       AVG(latency) as avg_latency, SUM(tokens_total) as total_tokens
-                FROM metrics WHERE timestamp > NOW() - INTERVAL '$1 hours'
-            """, hours)
-        return {
-            "total_requests": row[0] or 0,
-            "successful": row[1] or 0,
-            "failed": (row[0] or 0) - (row[1] or 0),
-            "success_rate": round((row[1] or 0) / (row[0] or 1) * 100, 2),
-            "avg_latency": round(row[2] or 0, 2),
-            "total_tokens": row[3] or 0
-        }
-    
-    async def get_setting(self, key: str) -> Optional[str]:
-        if self.use_sqlite:
-            row = await self._fetchone("SELECT value FROM settings WHERE key = ?", key)
-        else:
-            row = await self._fetchone("SELECT value FROM settings WHERE key = $1", key)
-        return row[0] if row else None
-    
-    async def set_setting(self, key: str, value: str):
-        if self.use_sqlite:
-            await self._execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", key, value)
-        else:
-            await self._execute("INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2", key, value)
-    
-    async def get_all_settings(self) -> Dict[str, str]:
-        if self.use_sqlite:
-            rows = await self._fetchall("SELECT key, value FROM settings")
-        else:
-            rows = await self._fetchall("SELECT key, value FROM settings")
-        return {row[0]: row[1] for row in rows}
-    
-    async def create_api_key(self, name: str) -> str:
-        key = f"gpt4m_{secrets.token_urlsafe(24)}"
-        if self.use_sqlite:
-            await self._execute("INSERT INTO api_keys (key, name) VALUES (?, ?)", key, name)
-        else:
-            await self._execute("INSERT INTO api_keys (key, name) VALUES ($1, $2)", key, name)
-        return key
-    
-    async def get_api_keys(self) -> List[Dict]:
-        if self.use_sqlite:
-            rows = await self._fetchall("SELECT key, name, created_at, last_used, is_active FROM api_keys")
-        else:
-            rows = await self._fetchall("SELECT key, name, created_at, last_used, is_active FROM api_keys")
-        return [{"key": r[0], "name": r[1], "created": r[2], "last_used": r[3], "active": bool(r[4])} for r in rows]
-    
-    async def revoke_api_key(self, key: str):
-        if self.use_sqlite:
-            await self._execute("UPDATE api_keys SET is_active = 0 WHERE key = ?", key)
-        else:
-            await self._execute("UPDATE api_keys SET is_active = FALSE WHERE key = $1", key)
-    
-    async def verify_api_key(self, key: str) -> bool:
-        if self.use_sqlite:
-            row = await self._fetchone("SELECT is_active FROM api_keys WHERE key = ? AND is_active = 1", key)
-        else:
-            row = await self._fetchone("SELECT is_active FROM api_keys WHERE key = $1 AND is_active = TRUE", key)
-        if row:
-            if self.use_sqlite:
-                await self._execute("UPDATE api_keys SET last_used = CURRENT_TIMESTAMP WHERE key = ?", key)
-            else:
-                await self._execute("UPDATE api_keys SET last_used = CURRENT_TIMESTAMP WHERE key = $1", key)
-            return True
-        return False
-    
-    # 🔥 ИСПРАВЛЕННЫЙ МЕТОД create_admin_session (datetime, а не строка)
-    async def create_admin_session(self, ip: str, user_agent: str) -> str:
-        token = secrets.token_urlsafe(48)
-        expires_at = datetime.now() + timedelta(seconds=SESSION_TIMEOUT)
-        if self.use_sqlite:
-            await self._execute("INSERT INTO admin_sessions (token, ip, user_agent, expires_at) VALUES (?, ?, ?, ?)", token, ip, user_agent, expires_at.isoformat())
-        else:
-            await self._execute("INSERT INTO admin_sessions (token, ip, user_agent, expires_at) VALUES ($1, $2, $3, $4)", token, ip, user_agent, expires_at)
-        return token
-    
-    # 🔥 ИСПРАВЛЕННЫЙ МЕТОД verify_admin_session (сравнение datetime)
-    async def verify_admin_session(self, token: str, ip: str, user_agent: str) -> bool:
-        if self.use_sqlite:
-            row = await self._fetchone("SELECT ip, user_agent, expires_at FROM admin_sessions WHERE token = ?", token)
-        else:
-            row = await self._fetchone("SELECT ip, user_agent, expires_at FROM admin_sessions WHERE token = $1", token)
-        if not row:
+    async def create_session(self, session_id: str) -> bool:
+        try:
+            async with self.get_connection() as conn:
+                await conn.execute(
+                    "INSERT OR IGNORE INTO sessions (session_id) VALUES (?)",
+                    (session_id,)
+                )
+                await conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Error creating session: {e}")
             return False
-        session_ip, session_ua, expires_at = row
-        if session_ip != ip or session_ua != user_agent:
-            return False
-        if expires_at < datetime.now():
-            if self.use_sqlite:
-                await self._execute("DELETE FROM admin_sessions WHERE token = ?", token)
-            else:
-                await self._execute("DELETE FROM admin_sessions WHERE token = $1", token)
-            return False
-        return True
     
-    async def delete_admin_session(self, token: str):
-        if self.use_sqlite:
-            await self._execute("DELETE FROM admin_sessions WHERE token = ?", token)
-        else:
-            await self._execute("DELETE FROM admin_sessions WHERE token = $1", token)
+    async def log_provider_call(self, provider: str, success: bool, latency: float, error: str = None):
+        try:
+            async with self.get_connection() as conn:
+                await conn.execute(
+                    "INSERT INTO provider_logs (provider, success, latency, error) VALUES (?, ?, ?, ?)",
+                    (provider, 1 if success else 0, latency, error)
+                )
+                await conn.commit()
+        except Exception as e:
+            logger.error(f"Error logging provider call: {e}")
 
-# ============================================================
-# ПРОВАЙДЕР
-# ============================================================
 class ProviderManager:
     def __init__(self):
         self.timeout = REQUEST_TIMEOUT
         self.user_agents = USER_AGENTS
+        self.provider = {
+            "name": "chateverywhere",
+            "url": CHATEVERYWHERE_URL,
+            "enabled": True
+        }
     
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.5, min=0.5, max=3))
-    async def _call_provider(self, messages: List[Dict], device_id: str, temperature: float, max_tokens: int) -> Tuple[Optional[str], float]:
+    @retry(
+        stop=stop_after_attempt(2),
+        wait=wait_exponential(multiplier=0.5, min=0.5, max=5),
+        retry=retry_if_exception_type((httpx.TimeoutException, httpx.ConnectError))
+    )
+    async def _call_provider(self, messages: List[Dict], temperature: float, max_tokens: int) -> Tuple[Optional[str], float]:
         start_time = time.time()
         
+        # Формируем сообщения
         has_system = any(m.get('role') == 'system' for m in messages)
         if not has_system:
-            enriched = [{"role": "system", "content": API_SYSTEM_PROMPT}] + messages
+            enriched_messages = [{"role": "system", "content": API_SYSTEM_PROMPT}] + messages
         else:
-            enriched = []
-            for m in messages:
-                if m.get('role') == 'system':
-                    enriched.append({"role": "system", "content": API_SYSTEM_PROMPT})
-                else:
-                    enriched.append(m)
+            enriched_messages = messages
         
         payload = {
             "model": "gpt-4o-mini",
-            "messages": enriched,
+            "messages": enriched_messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": False
@@ -469,153 +234,124 @@ class ProviderManager:
         headers = {
             "User-Agent": random.choice(self.user_agents),
             "Content-Type": "application/json",
-            "Accept": "application/json",
-            "x-device-id": device_id,
+            "Accept": "application/json"
         }
         
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
-            response = await client.post(CHATEVERYWHERE_URL, json=payload, headers=headers)
-            elapsed = time.time() - start_time
-            
-            if response.status_code == 200:
-                content = response.text.strip()
-                if content and len(content) > 5:
-                    return content, elapsed
-                raise Exception("Empty response")
-            raise Exception(f"HTTP {response.status_code}")
-    
-    async def get_response(self, messages: List[Dict], temperature: float, max_tokens: int, session_id: str) -> Tuple[Optional[str], str, int]:
-        _, device_id = await db.create_or_get_session(session_id)
-        
         try:
-            content, elapsed = await self._call_provider(messages, device_id, temperature, max_tokens)
-            tokens = len(content) // 4
-            
-            # Ротация каждые 5 запросов
-            if self.use_sqlite:
-                row = await self._fetchone("SELECT request_count FROM sessions WHERE session_id = ?", session_id)
-            else:
-                row = await self._fetchone("SELECT request_count FROM sessions WHERE session_id = $1", session_id)
-            if row and row[0] % 5 == 0:
-                await self.rotate_device(session_id)
-            
-            await self.save_metric("chateverywhere", True, elapsed, tokens)
-            return content, "chateverywhere", tokens
-            
+            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+                response = await client.post(self.provider["url"], json=payload, headers=headers)
+                elapsed = time.time() - start_time
+                
+                if response.status_code == 200:
+                    content = response.text.strip()
+                    
+                    if content and len(content) > 5:
+                        logger.info(f"Provider returned {len(content)} chars in {elapsed:.2f}s")
+                        return content, elapsed
+                    else:
+                        raise Exception("Empty or too short response")
+                else:
+                    error_msg = f"HTTP {response.status_code}: {response.text[:200]}"
+                    logger.warning(f"Provider error: {error_msg}")
+                    raise Exception(error_msg)
         except Exception as e:
-            await self.save_metric("chateverywhere", False, 0, 0, str(e))
-            raise Exception(f"Provider failed: {str(e)}")
+            elapsed = time.time() - start_time
+            error_msg = f"Provider error: {str(e)}"
+            logger.error(error_msg)
+            raise Exception(error_msg)
+    
+    async def get_response(self, messages: List[Dict], temperature: float, max_tokens: int) -> Tuple[Optional[str], str]:
+        try:
+            content, elapsed = await self._call_provider(messages, temperature, max_tokens)
+            if content:
+                await db.log_provider_call("chateverywhere", True, elapsed)
+                return content, "chateverywhere"
+        except Exception as e:
+            error_msg = str(e)
+            await db.log_provider_call("chateverywhere", False, 0, error_msg)
+            raise Exception(f"ChatEverywhere failed: {error_msg}")
+    
+    async def stream_response(self, messages: List[Dict], temperature: float, max_tokens: int):
+        try:
+            content, provider = await self.get_response(messages, temperature, max_tokens)
+            
+            words = content.split()
+            chunk_size = max(1, len(words) // 20)
+            
+            for i in range(0, len(words), chunk_size):
+                chunk = " ".join(words[i:i+chunk_size])
+                yield f"data: {json.dumps({'choices': [{'delta': {'content': chunk}}]})}\n\n"
+                await asyncio.sleep(0.1)
+            
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            logger.error(f"Stream error: {e}")
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
-# ============================================================
-# ИНИЦИАЛИЗАЦИЯ
-# ============================================================
+class StatsManager:
+    def __init__(self):
+        self.stats_file = STATS_FILE
+        self.lock = asyncio.Lock()
+    
+    async def load_stats(self):
+        if os.path.exists(self.stats_file):
+            try:
+                with open(self.stats_file, "r") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.error(f"Error loading stats: {e}")
+        return {"total_requests": 0, "today_requests": 0, "last_reset": datetime.now().strftime("%Y-%m-%d")}
+    
+    async def save_stats(self, stats):
+        async with self.lock:
+            try:
+                with open(self.stats_file, "w") as f:
+                    json.dump(stats, f, indent=2)
+            except Exception as e:
+                logger.error(f"Error saving stats: {e}")
+    
+    async def update_stats(self):
+        try:
+            stats = await self.load_stats()
+            today = datetime.now().strftime("%Y-%m-%d")
+            if stats["last_reset"] != today:
+                stats["today_requests"] = 0
+                stats["last_reset"] = today
+            stats["total_requests"] += 1
+            stats["today_requests"] += 1
+            await self.save_stats(stats)
+            return stats
+        except Exception as e:
+            logger.error(f"Error updating stats: {e}")
+            return {"total_requests": 1, "today_requests": 1, "last_reset": datetime.now().strftime("%Y-%m-%d")}
+
+# Инициализация
 db = Database()
 provider_manager = ProviderManager()
-logger = logging.getLogger(__name__)
+stats_manager = StatsManager()
 
-# ============================================================
-# PYDANTIC
-# ============================================================
-class Message(BaseModel):
-    role: str
-    content: str
-    name: Optional[str] = None
-
-class ChatRequest(BaseModel):
-    messages: List[Message]
-    model: str = "gpt-4o-mini"
-    temperature: float = Field(0.7, ge=0.0, le=2.0)
-    max_tokens: int = Field(4000, ge=1)
-    stream: bool = False
-    system_prompt: Optional[str] = None
-
-# ============================================================
-# АВТОРИЗАЦИЯ
-# ============================================================
-async def verify_api_key(request: Request):
-    api_key = request.headers.get("X-API-Key")
-    if not api_key:
-        raise HTTPException(status_code=401, detail="X-API-Key header required")
-    
-    if not await db.verify_api_key(api_key):
-        raise HTTPException(status_code=401, detail="Invalid or inactive API key")
-    
-    return True
-
-async def verify_admin_session_cookie(request: Request):
-    token = request.cookies.get("admin_token")
-    if not token:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    
-    client_ip = request.client.host or "unknown"
-    user_agent = request.headers.get("User-Agent", "")
-    
-    if not await db.verify_admin_session(token, client_ip, user_agent):
-        raise HTTPException(status_code=401, detail="Invalid session")
-    
-    return token
-
-# ============================================================
-# HTML ШАБЛОНЫ (КОРОТКИЕ)
-# ============================================================
-LOGIN_HTML = """<!DOCTYPE html>
-<html>
-<head><title>GPT-4M Admin</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#e0e0e0;font-family:system-ui;min-height:100vh;display:flex;justify-content:center;align-items:center}.login-box{background:#14141c;border:1px solid #2a2a3a;border-radius:16px;padding:48px;max-width:400px;width:100%}.login-box h1{font-size:24px;background:linear-gradient(135deg,#00d4ff,#7b2ffc);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:8px}.login-box .sub{color:#666;font-size:14px;margin-bottom:30px}.login-box input{width:100%;padding:12px 16px;background:#0d0d16;border:1px solid #2a2a3a;border-radius:8px;color:#e0e0e0;font-size:15px;margin-bottom:14px}.login-box input:focus{outline:none;border-color:#7b2ffc}.login-box button{width:100%;padding:12px;background:linear-gradient(135deg,#7b2ffc,#00d4ff);border:none;border-radius:8px;color:#fff;font-weight:bold;font-size:16px;cursor:pointer}.login-box button:hover{opacity:0.9}.login-box .error{color:#f87171;font-size:14px;margin-top:12px;display:none}.login-box .error.show{display:block}
-</style>
-</head>
-<body>
-<div class="login-box"><h1>🚀 GPT-4M</h1><div class="sub">Admin Panel Login</div>
-<input type="text" id="username" placeholder="Username"><input type="password" id="password" placeholder="Password">
-<button onclick="login()">Login</button><div class="error" id="error">Invalid credentials</div></div>
-<script>
-async function login(){const u=document.getElementById('username').value,p=document.getElementById('password').value,e=document.getElementById('error');e.classList.remove('show');if(!u||!p){e.textContent='Fill all fields';e.classList.add('show');return}try{const r=await fetch('/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});if(r.ok)window.location.href='/admin/dashboard';else{const d=await r.json();e.textContent=d.detail||'Invalid';e.classList.add('show')}}catch(err){e.textContent='Connection error: '+err.message;e.classList.add('show')}}
-document.getElementById('password').addEventListener('keydown',e=>{if(e.key==='Enter')login()});
-</script></body></html>"""
-
-DASHBOARD_HTML = """<!DOCTYPE html>
-<html>
-<head><title>GPT-4M Admin</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#e0e0e0;font-family:system-ui;padding:20px}.container{max-width:1200px;margin:0 auto}.header{display:flex;justify-content:space-between;align-items:center;padding:20px 0;border-bottom:1px solid #1a1a26;margin-bottom:30px}.header h1{background:linear-gradient(135deg,#00d4ff,#7b2ffc);-webkit-background-clip:text;-webkit-text-fill-color:transparent}.header .logout{color:#888;text-decoration:none;padding:8px 16px;border:1px solid #2a2a3a;border-radius:8px}.header .logout:hover{background:#1a1a26}.card{background:#14141c;border:1px solid #1a1a26;border-radius:12px;padding:24px;margin-bottom:20px}.card h3{color:#888;font-size:13px;text-transform:uppercase;margin-bottom:16px;border-bottom:1px solid #1a1a26;padding-bottom:12px}.setting-group{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #0d0d16}.setting-group:last-child{border-bottom:none}.setting-label{font-size:14px;color:#ccc}.setting-label small{display:block;font-size:11px;color:#555}.setting-control input,.setting-control select{background:#0d0d16;border:1px solid #2a2a3a;border-radius:6px;color:#e0e0e0;padding:6px 12px;font-size:14px;width:140px}.setting-control textarea{width:100%;background:#0d0d16;border:1px solid #2a2a3a;border-radius:6px;color:#e0e0e0;padding:8px;font-family:monospace;min-height:80px;resize:vertical}.flex{display:flex;gap:10px;flex-wrap:wrap}button{padding:8px 20px;background:linear-gradient(135deg,#7b2ffc,#00d4ff);border:none;border-radius:6px;color:#fff;font-weight:bold;cursor:pointer}button:hover{opacity:0.8}button.danger{background:linear-gradient(135deg,#ef4444,#dc2626)}.key-item{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #1a1a26;font-size:13px;font-family:monospace}.key-value{color:#60a5fa}.badge{padding:2px 10px;border-radius:12px;font-size:11px;font-weight:bold}.badge.active{background:#064e3b;color:#4ade80}.badge.inactive{background:#4a1a1a;color:#f87171}.toast{position:fixed;bottom:20px;right:20px;background:#1a1a26;border:1px solid #2a2a3a;padding:16px 24px;border-radius:10px;display:none;max-width:400px;z-index:1000}.toast.show{display:block;animation:slideUp 0.3s ease}.toast.success{border-color:#4ade80}.toast.error{border-color:#f87171}@keyframes slideUp{from{transform:translateY(20px);opacity:0}to{transform:translateY(0);opacity:1}}.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:20px}@media(max-width:768px){.grid-2{grid-template-columns:1fr}}.stats-grid{display:flex;gap:30px;flex-wrap:wrap}.stats-grid .num{font-size:24px;font-weight:bold;color:#60a5fa}.stats-grid .label{color:#888;font-size:12px}
-</style>
-</head>
-<body>
-<div class="container"><div class="header"><h1>🚀 GPT-4M Admin</h1><a href="/admin/logout" class="logout">🚪 Logout</a></div>
-<div class="grid-2"><div class="card" id="settings"></div><div class="card"><h3>🔑 API Keys</h3><div class="flex"><input type="text" id="keyName" placeholder="Key name..." style="flex:1;background:#0d0d16;border:1px solid #2a2a3a;border-radius:6px;color:#e0e0e0;padding:8px;"><button onclick="createKey()">Create</button></div><div id="keys" style="margin-top:12px;"></div></div></div>
-<div class="card"><h3>📊 Statistics</h3><div class="stats-grid" id="stats"><div><div class="label">Total Requests</div><div class="num" id="stat_total">-</div></div><div><div class="label">Success Rate</div><div class="num" style="color:#4ade80;" id="stat_success">-</div></div><div><div class="label">Avg Latency</div><div class="num" style="color:#fbbf24;" id="stat_latency">-</div></div><div><div class="label">Total Tokens</div><div class="num" style="color:#a78bfa;" id="stat_tokens">-</div></div></div></div></div>
-<div id="toast" class="toast"></div>
-<script>
-function toast(msg,type='success'){const t=document.getElementById('toast');t.textContent=msg;t.className='toast show '+type;setTimeout(()=>t.className='toast',3000)}
-async function fetchAPI(url,opts={}){const r=await fetch(url,{...opts,credentials:'include'});if(!r.ok){const e=await r.json();throw new Error(e.detail||'Error')}return r.json()}
-async function loadSettings(){try{const s=await fetchAPI('/admin/settings');const html=Object.entries(s).map(([k,v])=>{let input=`<input value="${v}" onchange="updateSetting('${k}',this.value)">`;if(k==='system_prompt')input=`<textarea onchange="updateSetting('${k}',this.value)">${v}</textarea>`;const labels={default_temperature:'Temperature',default_max_tokens:'Max Tokens',default_model:'Model',rotation_interval:'Rotation',device_pool_size:'Pool Size',cache_enabled:'Cache',cache_ttl:'Cache TTL',rate_limit:'Rate Limit',system_prompt:'System Prompt'};return `<div class="setting-group"><div class="setting-label">${labels[k]||k}</div><div class="setting-control">${input}</div></div>`}).join('');document.getElementById('settings').innerHTML='<h3>⚙️ Settings</h3>'+html}catch(e){document.getElementById('settings').innerHTML='<h3>⚙️ Settings</h3><div style="color:#f87171;">Error loading</div>'}}
-async function updateSetting(k,v){try{await fetchAPI('/admin/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k,value:v})});toast('✅ '+k+' updated')}catch(e){toast('❌ '+e.message,'error')}}
-async function loadKeys(){try{const k=await fetchAPI('/admin/api-keys');document.getElementById('keys').innerHTML=k.map(k=>`<div class="key-item"><span><span class="key-value">${k.key}</span><span class="badge ${k.active?'active':'inactive'}">${k.active?'Active':'Revoked'}</span> ${k.name}</span>${k.active?`<button class="danger" onclick="revokeKey('${k.key}')">Revoke</button>`:''}</div>`).join('')||'No keys'}catch(e){document.getElementById('keys').textContent='Error'}}
-async function createKey(){const n=document.getElementById('keyName').value.trim();if(!n){toast('Enter name','error');return}try{const d=await fetchAPI('/admin/api-keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})});toast('✅ Key: '+d.key);document.getElementById('keyName').value='';loadKeys()}catch(e){toast('❌ '+e.message,'error')}}
-async function revokeKey(k){if(!confirm('Revoke?'))return;try{await fetchAPI('/admin/api-keys/'+k,{method:'DELETE'});toast('✅ Revoked');loadKeys()}catch(e){toast('❌ '+e.message,'error')}}
-async function loadStats(){try{const s=await fetchAPI('/v1/metrics');document.getElementById('stat_total').textContent=s.total_requests||0;document.getElementById('stat_success').textContent=(s.success_rate||0)+'%';document.getElementById('stat_latency').textContent=(s.avg_latency||0)+'ms';document.getElementById('stat_tokens').textContent=s.total_tokens||0}catch(e){}}
-loadSettings();loadKeys();loadStats();setInterval(loadStats,10000);
-</script></body></html>"""
-
-# ============================================================
-# FASTAPI APP
-# ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("="*60)
-    print("🚀 GPT-4M PROXY WITH POSTGRESQL")
-    print("="*60)
-    await db.init_pool()
-    print(f"🌐 Admin Panel: https://apigpt4m.up.railway.app/admin")
-    print(f"👤 Login: {ADMIN_USERNAME}")
-    print("="*60)
+    logger.info("="*50)
+    logger.info("🚀 FaaahhAPI v3.4 — ТОЛЬКО CHATEVERYWHERE")
+    logger.info("="*50)
+    logger.info(f"🆔 Identity: FaaahhAPI by @nur15kp")
+    logger.info(f"📍 Provider: ChatEverywhere")
+    logger.info(f"🎭 User-Agents: {len(USER_AGENTS)}")
+    logger.info(f"🧠 Context: {MAX_HISTORY} messages")
+    logger.info(f"📏 Max message length: {MAX_MESSAGE_LENGTH} chars")
+    logger.info(f"⏱️  Timeout: {REQUEST_TIMEOUT}s")
+    logger.info(f"🌐 Port: {os.environ.get('PORT', 8080)}")
+    logger.info("="*50)
     yield
-    if db.pool:
-        await db.pool.close()
-        print("🐘 PostgreSQL connection closed")
+    logger.info("Shutting down FaaahhAPI...")
 
-app = FastAPI(title="GPT-4M Proxy", lifespan=lifespan)
+app = FastAPI(
+    title="FaaahhAPI",
+    description="FaaahhAPI by @nur15kp",
+    version="3.4",
+    lifespan=lifespan
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -625,163 +361,215 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============================================================
-# АДМИН ЭНДПОИНТЫ
-# ============================================================
+async def rate_limiter(request: Request):
+    from collections import defaultdict
+    
+    client_ip = request.client.host if request.client else "unknown"
+    current_time = time.time()
+    
+    if not hasattr(rate_limiter, 'requests'):
+        rate_limiter.requests = defaultdict(list)
+        rate_limiter.last_cleanup = current_time
+    
+    if current_time - rate_limiter.last_cleanup > 60:
+        rate_limiter.requests.clear()
+        rate_limiter.last_cleanup = current_time
+    
+    rate_limiter.requests[client_ip] = [
+        t for t in rate_limiter.requests[client_ip] 
+        if current_time - t < 60
+    ]
+    
+    if len(rate_limiter.requests[client_ip]) >= 60:
+        logger.warning(f"Rate limit exceeded for {client_ip}")
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Max 60 requests per minute")
+    
+    rate_limiter.requests[client_ip].append(current_time)
+    return True
 
-@app.get("/admin")
-async def admin_login_page():
-    return HTMLResponse(LOGIN_HTML)
-
-@app.post("/admin/login")
-async def admin_login(request: Request):
-    try:
-        data = await request.json()
-        username = data.get("username")
-        password = data.get("password")
-        
-        if not username or not password:
-            raise HTTPException(401, "Username and password required")
-        
-        password_hash = hashlib.sha256(password.encode()).hexdigest()
-        if username != ADMIN_USERNAME or password_hash != ADMIN_PASSWORD_HASH:
-            raise HTTPException(401, "Invalid credentials")
-        
-        client_ip = request.client.host or "unknown"
-        user_agent = request.headers.get("User-Agent", "")
-        
-        token = await db.create_admin_session(client_ip, user_agent)
-        
-        response = JSONResponse({"status": "ok"})
-        response.set_cookie(
-            key="admin_token",
-            value=token,
-            httponly=True,
-            secure=True,
-            samesite="lax",
-            max_age=SESSION_TIMEOUT
-        )
-        return response
-    except Exception as e:
-        print(f"Login error: {str(e)}")
-        raise HTTPException(500, detail=f"Server error: {str(e)}")
-
-@app.get("/admin/dashboard")
-async def admin_dashboard(request: Request):
-    try:
-        await verify_admin_session_cookie(request)
-    except HTTPException:
-        return RedirectResponse(url="/admin", status_code=302)
-    return HTMLResponse(DASHBOARD_HTML)
-
-@app.get("/admin/logout")
-async def admin_logout(request: Request):
-    token = request.cookies.get("admin_token")
-    if token:
-        await db.delete_admin_session(token)
-    response = RedirectResponse(url="/admin", status_code=302)
-    response.delete_cookie("admin_token")
-    return response
-
-# ============================================================
-# АДМИН API
-# ============================================================
-
-@app.get("/admin/settings")
-async def get_settings(token: str = Depends(verify_admin_session_cookie)):
-    return await db.get_all_settings()
-
-@app.post("/admin/settings")
-async def update_setting(request: Request, token: str = Depends(verify_admin_session_cookie)):
-    data = await request.json()
-    await db.set_setting(data['key'], data['value'])
-    return {"status": "updated"}
-
-@app.get("/admin/api-keys")
-async def get_api_keys(token: str = Depends(verify_admin_session_cookie)):
-    return await db.get_api_keys()
-
-@app.post("/admin/api-keys")
-async def create_api_key(request: Request, token: str = Depends(verify_admin_session_cookie)):
-    data = await request.json()
-    key = await db.create_api_key(data.get('name', 'unnamed'))
-    return {"key": key}
-
-@app.delete("/admin/api-keys/{key}")
-async def revoke_api_key(key: str, token: str = Depends(verify_admin_session_cookie)):
-    await db.revoke_api_key(key)
-    return {"status": "revoked"}
-
-# ============================================================
-# ПУБЛИЧНЫЙ API
-# ============================================================
-
-@app.get("/")
-async def index():
-    return HTMLResponse("""
-    <html><head><title>GPT-4M</title></head>
-    <body style="background:#0a0a0f;color:#e0e0e0;font-family:system-ui;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;">
-        <div style="background:#14141c;padding:40px;border-radius:16px;border:1px solid #2a2a3a;text-align:center;">
-            <h1 style="background:linear-gradient(135deg,#00d4ff,#7b2ffc);-webkit-background-clip:text;-webkit-text-fill-color:transparent;">🚀 GPT-4M</h1>
-            <p style="color:#888;margin:16px 0;">GPT-4o-mini · 67 context · IP sessions</p>
-            <a href="/admin" style="color:#7b2ffc;text-decoration:none;border:1px solid #2a2a3a;padding:8px 24px;border-radius:8px;display:inline-block;">🔐 Admin Panel</a>
-        </div>
-    </body></html>
-    """)
+async def get_session_id(request: Request) -> str:
+    session_id = request.headers.get("X-Session-ID")
+    if not session_id:
+        session_id = str(uuid.uuid4())
+    return session_id
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatRequest, req: Request, api_key: bool = Depends(verify_api_key)):
+async def chat_completions(
+    request: ChatRequest,
+    req: Request,
+    session_id: str = Depends(get_session_id),
+    _: bool = Depends(rate_limiter)
+):
     try:
-        client_ip = req.client.host or "unknown"
-        if client_ip.startswith("::ffff:"):
-            client_ip = client_ip[7:]
+        logger.info(f"Request from session {session_id}, model: {request.model}, stream: {request.stream}")
         
-        session_id, _ = await db.create_or_get_session(client_ip)
-        history = await db.get_history(session_id, MAX_HISTORY)
+        await db.create_session(session_id)
+        await stats_manager.update_stats()
+        
+        history = await db.get_history(session_id)
         
         messages = []
+        
         if request.system_prompt:
             messages.append({"role": "system", "content": request.system_prompt})
+        else:
+            messages.append({"role": "system", "content": API_SYSTEM_PROMPT})
         
         for msg in history:
             messages.append(msg)
+        
         for msg in request.messages:
             messages.append(msg.dict())
         
-        if len(messages) > MAX_HISTORY + 1:
-            messages = [messages[0]] + messages[-MAX_HISTORY:]
+        # Проверяем длину
+        total_length = sum(len(msg.get("content", "")) for msg in messages)
+        if total_length > MAX_MESSAGE_LENGTH * 10:
+            while total_length > MAX_MESSAGE_LENGTH * 10 and len(messages) > 2:
+                removed = messages.pop(1)
+                total_length -= len(removed.get("content", ""))
         
-        content, provider, tokens = await provider_manager.get_response(
-            messages, request.temperature, request.max_tokens, session_id
-        )
-        
-        await db.save_message(session_id, "user", request.messages[-1].content)
-        await db.save_message(session_id, "assistant", content)
-        
-        return {
-            "id": f"chatcmpl-{int(time.time())}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": "gpt-4o-mini",
-            "provider": provider,
-            "session": {"id": session_id[:8]+"...", "ip": client_ip, "history": len(history)+1},
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": len(str(messages))//4, "completion_tokens": tokens, "total_tokens": (len(str(messages))//4)+tokens}
-        }
+        if request.stream:
+            return StreamingResponse(
+                provider_manager.stream_response(
+                    messages,
+                    request.temperature,
+                    request.max_tokens
+                ),
+                media_type="text/event-stream"
+            )
+        else:
+            content, provider = await provider_manager.get_response(
+                messages,
+                request.temperature,
+                request.max_tokens
+            )
+            
+            await db.save_message(session_id, "user", messages[-1].get("content", ""))
+            await db.save_message(session_id, "assistant", content)
+            
+            response = ChatResponse(
+                id=f"chatcmpl-{int(time.time())}",
+                created=int(time.time()),
+                model="faaahh",
+                provider=provider,
+                choices=[{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop"
+                }],
+                usage={
+                    "prompt_tokens": len(str(messages)) // 4,
+                    "completion_tokens": len(content) // 4,
+                    "total_tokens": (len(str(messages)) + len(content)) // 4
+                }
+            )
+            
+            logger.info(f"Response from {provider}, length: {len(content)} chars")
+            return response
+            
+    except HTTPException:
+        raise
     except Exception as e:
+        error_details = traceback.format_exc()
+        logger.error(f"Error in chat_completions: {error_details}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.get("/v1/models")
+async def list_models():
+    return {
+        "object": "list",
+        "data": [
+            {"id": "faaahh", "object": "model", "owned_by": "@nur15kp"},
+            {"id": "gpt-4o-mini", "object": "model"},
+            {"id": "gpt-3.5-turbo", "object": "model"}
+        ]
+    }
+
+@app.post("/v1/clear")
+async def clear_history_endpoint(session_id: str = Depends(get_session_id)):
+    try:
+        await db.clear_history(session_id)
+        return {"status": "success", "message": "History cleared", "session_id": session_id}
+    except Exception as e:
+        logger.error(f"Error clearing history: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/v1/metrics")
-async def get_metrics():
-    return await db.get_metrics(24)
+@app.get("/v1/history")
+async def get_history_endpoint(session_id: str = Depends(get_session_id)):
+    try:
+        history = await db.get_history(session_id)
+        return {"session_id": session_id, "history": history, "count": len(history)}
+    except Exception as e:
+        logger.error(f"Error getting history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/v1/stats")
+async def get_stats():
+    try:
+        stats = await stats_manager.load_stats()
+        return stats
+    except Exception as e:
+        logger.error(f"Error getting stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "timestamp": datetime.now().isoformat(), "service": "GPT-4M"}
+    return {
+        "status": "ok",
+        "identity": "FaaahhAPI by @nur15kp",
+        "timestamp": datetime.now().isoformat(),
+        "provider": "chateverywhere"
+    }
 
-# ============================================================
-# ЗАПУСК
-# ============================================================
+@app.get("/status")
+async def status():
+    try:
+        stats = await stats_manager.load_stats()
+        return {
+            "service": "FaaahhAPI",
+            "version": "3.4",
+            "identity": "FaaahhAPI by @nur15kp",
+            "status": "operational",
+            "provider": "chateverywhere",
+            "total_requests_all": stats.get("total_requests", 0),
+            "total_requests_today": stats.get("today_requests", 0),
+            "history_limit": MAX_HISTORY
+        }
+    except Exception as e:
+        logger.error(f"Error in status: {e}")
+        return {
+            "service": "FaaahhAPI",
+            "version": "3.4",
+            "status": "degraded",
+            "error": str(e)
+        }
+
+@app.get("/")
+async def index():
+    return {
+        "service": "FaaahhAPI v3.4",
+        "identity": "FaaahhAPI by @nur15kp",
+        "description": "ChatEverywhere only",
+        "motto": "It works... somehow",
+        "endpoints": {
+            "chat": "POST /v1/chat/completions",
+            "models": "GET /v1/models",
+            "history": "GET /v1/history",
+            "clear": "POST /v1/clear",
+            "stats": "GET /v1/stats",
+            "health": "GET /health",
+            "status": "GET /status"
+        }
+    }
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("api:app", host="0.0.0.0", port=PORT, workers=1)
+    
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(
+        "api:app",
+        host="0.0.0.0",
+        port=port,
+        workers=int(os.environ.get("WORKERS", 1)),
+        log_level="info"
+    )
