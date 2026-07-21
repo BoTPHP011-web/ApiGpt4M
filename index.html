@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>AsiyaOS</title>
+
+<!-- Fonts: Outfit for chrome/display, Inter for body text, JetBrains Mono for system/terminal data -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+<!-- Icon set -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+
+<!-- js-dos (DOSBox / DOSBox-X compiled to WebAssembly) — powers the .exe/.com/.bat emulation windows -->
+<link rel="stylesheet" href="https://v8.js-dos.com/latest/js-dos.css">
+<script src="https://v8.js-dos.com/latest/js-dos.js"></script>
+
+<!-- v86 (x86 PC emulator, JS/WASM) — powers the lightweight-Linux VM window (KolibriOS, TinyCore, FreeDOS, or a user-supplied .img/.iso) -->
+<script src="https://cdn.jsdelivr.net/npm/v86@0.5.44/build/libv86.js"></script>
+
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+  <!-- ============ DESKTOP ============ -->
+  <div id="desktop">
+
+    <!-- animated dawn-gradient wallpaper, purely decorative, sits behind everything -->
+    <div id="wallpaper" aria-hidden="true"></div>
+
+    <!-- desktop shortcut icons -->
+    <div id="desktop-icons">
+      <button class="desktop-icon" data-app="files">
+        <span class="di-glyph"><i class="fa-regular fa-folder-open"></i></span>
+        <span class="di-label">Файлы</span>
+      </button>
+      <button class="desktop-icon" data-app="dos">
+        <span class="di-glyph"><i class="fa-solid fa-square-terminal"></i></span>
+        <span class="di-label">DOS-плеер</span>
+      </button>
+      <button class="desktop-icon" data-app="linuxvm">
+        <span class="di-glyph"><i class="fa-brands fa-linux"></i></span>
+        <span class="di-label">Лёгкий Linux</span>
+      </button>
+      <button class="desktop-icon" data-app="terminal">
+        <span class="di-glyph"><i class="fa-solid fa-terminal"></i></span>
+        <span class="di-label">Терминал</span>
+      </button>
+      <button class="desktop-icon" data-app="sysinfo">
+        <span class="di-glyph"><i class="fa-solid fa-microchip"></i></span>
+        <span class="di-label">О системе</span>
+      </button>
+      <button class="desktop-icon" data-app="settings">
+        <span class="di-glyph"><i class="fa-solid fa-sliders"></i></span>
+        <span class="di-label">Параметры</span>
+      </button>
+    </div>
+
+    <!-- windows get injected here by app.js -->
+    <div id="window-layer"></div>
+
+    <!-- right-click desktop context menu -->
+    <div id="context-menu" class="menu-surface" hidden>
+      <button data-action="arrange"><i class="fa-solid fa-arrow-up-wide-short"></i>Упорядочить значки</button>
+      <button data-action="wallpaper"><i class="fa-solid fa-image"></i>Сменить обои</button>
+      <button data-action="fullscreen"><i class="fa-solid fa-expand"></i>Во весь экран</button>
+      <button data-action="about"><i class="fa-solid fa-circle-info"></i>О AsiyaOS</button>
+    </div>
+
+    <!-- start menu -->
+    <div id="start-menu" class="menu-surface" hidden>
+      <div class="start-header">
+        <div class="start-user">
+          <div class="start-avatar"><i class="fa-solid fa-feather-pointed"></i></div>
+          <div>
+            <div class="start-username">Гость</div>
+            <div class="start-os-tag">AsiyaOS 1.0 «Рассвет»</div>
+          </div>
+        </div>
+        <input id="start-search" type="text" placeholder="Найти приложение…" autocomplete="off">
+      </div>
+      <div class="start-grid" id="start-grid">
+        <!-- populated by app.js -->
+      </div>
+      <div class="start-footer">
+        <button id="start-fullscreen"><i class="fa-solid fa-expand"></i>Во весь экран</button>
+        <button id="start-about"><i class="fa-solid fa-circle-info"></i>О системе</button>
+      </div>
+    </div>
+
+    <!-- ============ TASKBAR ============ -->
+    <div id="taskbar">
+      <button id="start-button" aria-haspopup="true" aria-expanded="false">
+        <span class="asiya-mark">A</span>
+        <span class="start-label">Asiya</span>
+      </button>
+
+      <div id="taskbar-apps" role="tablist" aria-label="Открытые окна"></div>
+
+      <div id="tray">
+        <canvas id="tray-sparkline" width="90" height="28" title="Загрузка ЦП / ОЗУ"></canvas>
+        <div id="tray-stats">
+          <span id="tray-cpu">CPU 0%</span>
+          <span id="tray-ram">RAM 0%</span>
+        </div>
+        <button id="tray-fullscreen" title="Во весь экран"><i class="fa-solid fa-expand"></i></button>
+        <button id="tray-clock" title="Дата и время">
+          <span id="clock-time">00:00</span>
+          <span id="clock-date">--- --</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ APP TEMPLATES ============ -->
+  <!-- Cloned into windows at runtime; kept out of the live DOM tree until opened -->
+
+  <template id="tpl-files">
+    <div class="app-files">
+      <div class="files-toolbar">
+        <button class="fm-upload-btn"><i class="fa-solid fa-file-arrow-up"></i>Загрузить файл</button>
+        <input type="file" class="fm-upload-input" accept=".exe,.com,.bat,.zip" multiple hidden>
+        <span class="files-hint">.exe / .com / .bat / .zip — файлы остаются только в этой вкладке браузера</span>
+      </div>
+      <div class="files-list-head">
+        <span>Имя</span><span>Тип</span><span>Размер</span><span></span>
+      </div>
+      <div class="files-list"><!-- rows injected --></div>
+      <div class="files-empty">Пока пусто. Загрузите .exe, .com, .bat или .zip, чтобы запустить его в эмуляторе.</div>
+    </div>
+  </template>
+
+  <template id="tpl-dos">
+    <div class="app-dos">
+      <div class="dos-picker">
+        <i class="fa-solid fa-compact-disc"></i>
+        <p>Выберите загруженный файл, чтобы запустить его в DOSBox (WebAssembly)</p>
+        <select class="dos-select"></select>
+        <button class="dos-run-btn"><i class="fa-solid fa-play"></i>Запустить</button>
+      </div>
+      <div class="dos-stage" hidden></div>
+    </div>
+  </template>
+
+  <template id="tpl-linuxvm">
+    <div class="app-linuxvm">
+      <div class="vm-picker">
+        <i class="fa-brands fa-linux"></i>
+        <p>Полноценная виртуальная машина x86 (v86) — грузит целый образ диска, а не отдельный файл.
+           Готовые лёгкие системы свободно распространяются их авторами; свой образ можно загрузить отдельно.</p>
+
+        <div class="vm-presets">
+          <button class="vm-preset" data-name="KolibriOS" data-kind="hda" data-url="https://copy.sh/v86/images/kolibri.img">
+            <i class="fa-solid fa-feather"></i>
+            <span>KolibriOS</span>
+            <small>~1.4 МБ · ассемблерная ОС, грузится за секунды</small>
+          </button>
+          <button class="vm-preset" data-name="TinyCore Linux" data-kind="cdrom" data-url="https://copy.sh/v86/images/linux.iso">
+            <i class="fa-brands fa-linux"></i>
+            <span>TinyCore Linux</span>
+            <small>~20 МБ · настоящее ядро Linux, консоль/X</small>
+          </button>
+          <button class="vm-preset" data-name="FreeDOS" data-kind="hda" data-url="https://copy.sh/v86/images/freedos722.img">
+            <i class="fa-solid fa-floppy-disk"></i>
+            <span>FreeDOS</span>
+            <small>~700 КБ · свободный DOS-дистрибутив</small>
+          </button>
+        </div>
+
+        <div class="vm-divider">или свой образ</div>
+        <button class="vm-upload-btn"><i class="fa-solid fa-file-arrow-up"></i>Загрузить .img / .iso</button>
+        <input type="file" class="vm-upload-input" accept=".img,.iso" hidden>
+        <span class="vm-hint">Файл остаётся только в этой вкладке браузера и никуда не отправляется</span>
+      </div>
+      <div class="vm-stage" hidden>
+        <div class="vm-loading"><i class="fa-solid fa-circle-notch fa-spin"></i><span class="vm-loading-text">Загрузка…</span></div>
+        <div class="vm-screen-container">
+          <div class="vm-screen-text"></div>
+          <canvas class="vm-screen-canvas"></canvas>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <template id="tpl-sysinfo">
+    <div class="app-sysinfo">
+      <div class="si-hero">
+        <div class="si-mark">A</div>
+        <div>
+          <div class="si-name">AsiyaOS</div>
+          <div class="si-version">Версия 1.0 «Рассвет» · ядро asiya-6.9.2-dawn</div>
+        </div>
+      </div>
+      <dl class="si-specs">
+        <div><dt>Процессор</dt><dd>Asiya Vela M2 @ 3.40 GHz, 8 ядер</dd></div>
+        <div><dt>Оперативная память</dt><dd id="si-ram">—</dd></div>
+        <div><dt>Графика</dt><dd>Asiya Halo GPU, 4 ГБ VRAM</dd></div>
+        <div><dt>Диск</dt><dd id="si-disk">—</dd></div>
+        <div><dt>Ядро</dt><dd>asiya-6.9.2-dawn x86_64</dd></div>
+        <div><dt>Среда рабочего стола</dt><dd>Asiya Shell (веб)</dd></div>
+        <div><dt>Время работы</dt><dd id="si-uptime">00:00:00</dd></div>
+        <div><dt>Механизм эмуляции</dt><dd>js-dos · DOSBox / DOSBox-X (WebAssembly)</dd></div>
+      </dl>
+    </div>
+  </template>
+
+  <template id="tpl-settings">
+    <div class="app-settings">
+      <div class="settings-row">
+        <div>
+          <div class="settings-title">Тема оформления</div>
+          <div class="settings-sub">Светлая или тёмная оболочка</div>
+        </div>
+        <button class="settings-theme-toggle"><i class="fa-solid fa-moon"></i>Тёмная</button>
+      </div>
+      <div class="settings-row">
+        <div>
+          <div class="settings-title">Обои</div>
+          <div class="settings-sub">Циклический рассветный градиент</div>
+        </div>
+        <button class="settings-wallpaper-btn"><i class="fa-solid fa-shuffle"></i>Сменить</button>
+      </div>
+      <div class="settings-row">
+        <div>
+          <div class="settings-title">Полноэкранный режим</div>
+          <div class="settings-sub">Погружение без рамки браузера</div>
+        </div>
+        <button class="settings-fullscreen-btn"><i class="fa-solid fa-expand"></i>Включить</button>
+      </div>
+      <div class="settings-row">
+        <div>
+          <div class="settings-title">Сбросить виртуальные файлы</div>
+          <div class="settings-sub">Удалить все загруженные .exe/.zip из этой сессии</div>
+        </div>
+        <button class="settings-reset-btn"><i class="fa-solid fa-trash"></i>Очистить</button>
+      </div>
+    </div>
+  </template>
+
+  <template id="tpl-terminal">
+    <div class="app-terminal">
+      <div class="term-output"></div>
+      <div class="term-input-row">
+        <span class="term-prompt">guest@asiyaos:~$</span>
+        <input class="term-input" type="text" autocomplete="off" spellcheck="false">
+      </div>
+    </div>
+  </template>
+
+  <script src="app.js"></script>
+</body>
+</html>
